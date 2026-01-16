@@ -1,0 +1,763 @@
+---
+title: "FLASH-seq ONT"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: rmdformats::readthedown
+params:
+  yaml: "yaml"
+---
+
+```{r variable, include=FALSE, echo = FALSE}
+options(scipen=999)
+options(dplyr.summarise.inform = FALSE)
+
+invisible(suppressPackageStartupMessages(library(tidyverse)))
+suppressMessages(conflicted::conflict_prefer("filter", "dplyr"))
+suppressMessages(conflicted::conflict_prefer("lag", "dplyr"))
+
+yaml <- params$yaml
+assign("sampleSheet", yaml, envir = .GlobalEnv)
+source(system.file("extdata", "import_yaml.R", package="FSnanoporeR"))
+
+if(umi_type %in% c("MONOMER","TRIMER")){
+  UMI_CONDITION <- TRUE
+} else{
+  UMI_CONDITION <- FALSE
+} 
+
+output_sp <- output_suffix
+output_suffix <- paste0(output_sp, "_1")
+
+n_chunks <- length(list.files(output_dir, pattern = "demultiplexing_pass"))
+```
+
+```{r load files, include=FALSE, echo = FALSE}
+
+raw_reads_n <- system(intern = TRUE, command = paste0(
+  "wc -l ",
+  paste0(output_dir, output_sp, "_splitFASTQ/", output_sp, "_splitFASTQ1.fq"))
+) %>%
+  str_extract("\\d+") %>%
+  as.numeric()
+
+raw_reads_n <- raw_reads_n/4
+
+raw_reads <- vroom::vroom(paste0(output_dir, output_suffix, "_demultiplexing_pass/", output_suffix, "_read_length.report.txt"))
+
+raw_reads$read_length <- raw_reads$read_width
+raw_reads$average_bp_score <- raw_reads$avg_phred_quality / raw_reads$read_length
+```
+
+Overview of the sequencing results prior to mapping / gene assignment. To keep it light and fast, will run only on the first chunk of data and extrapolate the real numbers by multiplying by the number of chunks.
+
+# General Variables
+
+```{r Summary variable, include=TRUE, echo = FALSE}
+
+knitr::kable(align = "lc",
+    tibble(
+    "Sample ID" = output_suffix,
+    "Output Directory" = output_dir,
+    "Number of Input Reads" = nrow(raw_reads),
+    "PCR Adapter (chimeric detection)" = pcr_adapter,
+    "Barcode / Adapter / (UMI) detection windows (bp)" = bc_detection_window,
+    "Chimeric Detection - Seq. identity (%)" = 100*blast_identity,
+    "Validate Chim. Reads" = validate_chimeric,
+    "Validate Chim. Reads - overlap read/segment" = overlap_threshold,
+    "Barcode Detection Seq." = barcode_primer,
+    "Barcode Identity (%)" = 100*blast_identity,
+    "Barcode Selected (#)" = length(selected_bc),
+    "Read Trimming" = read_trimming,
+    "Demultiplexing - Min. Reads" = min_reads,
+    ) %>% t()
+) 
+
+```
+
+# Raw Reads
+
+- Read lengths (0-12Kb limits)
+- Number of raw reads
+- Read average-phred score (post-basecalling)
+
+On at most 25 randomly selected cells.
+
+```{r input FASTQ_1, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+suppressWarnings(print(
+ggplot() + 
+    geom_histogram(data = raw_reads, aes(read_length), binwidth = 100) + 
+    theme_bw(base_size = 18) +
+    ylab("Reads") + 
+    xlab("Read Length (bp)") +
+    scale_x_continuous(breaks = seq(0,ceiling(max(raw_reads$read_length)*1.1),1000), limits = c(0,12000), labels = scales::comma) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    annotate("text", x=Inf, y = Inf, vjust = "inward", hjust = 1, size = 6,
+             label = paste0("\nMean (bp): ", floor(mean(raw_reads$read_length)), "\n",
+                            "Med (bp): ", floor(median(raw_reads$read_length)), "\n",
+                            "SD (bp): ", floor(sd(raw_reads$read_length)))) +
+    ggtitle("Raw Reads")
+))
+```
+
+```{r input FASTQ_2, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+#raw_reads <- mutate(raw_reads, read_bp_score_average= read_bp_score_total/read_length)
+
+  ggplot() + 
+    geom_histogram(data = raw_reads, aes(average_bp_score), binwidth = 5) + 
+    theme_bw(base_size = 18) +
+    ylab("Reads") + 
+    xlab("Average read bp quality (Phred)") +
+    scale_y_continuous(labels = scales::comma) +
+    scale_x_continuous(breaks = seq(0,ceiling(max(raw_reads$average_bp_score)*1.1),5)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    annotate("text", x=Inf, y = Inf, vjust = "inward", hjust = 0, size = 6,
+             label = paste0("\nMean: ", floor(mean(raw_reads$average_bp_score)), "\n",
+                            "Med: ", floor(median(raw_reads$average_bp_score)), "\n",
+                            "SD: ", floor(sd(raw_reads$average_bp_score)))) +
+    ggtitle("Read Quality")
+```
+
+
+# Chimeric Reads Detection
+
+## BLAST
+
+Nanopore libraries are prepared by ligation. This method can results in chimeric artefacts where two or more reads are combined. In many cases, dorado/guppy does not properly cut these reads. To detect and split them, BLASTn-Short is used, looking for the PCR adapter sequence: `r pcr_adapter`.
+In an ideal scenario, each read would have two PCR adapters sequences, one in + and one in - orientation.
+
+Graphics performed on a sub-sample of 500,000 lines.
+
+```{r blast_1, include=TRUE, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+# blast_search <- read_tsv(paste0(output_dir, output_suffix, "_blast_search.txt"), show_col_types = FALSE, col_names = FALSE) 
+blast_search <- vroom::vroom(paste0(output_dir, output_suffix, "_blast_search.txt"), show_col_types = FALSE, col_names = FALSE, delim = "\t", num_threads = n_cores, n_max = 1000000) 
+    
+blast_search.filter <- filter(blast_search, X12 > floor(0.6*nchar(pcr_adapter)) & X3 >= blast_identity)
+knitr::kable(align = "lc",
+    tibble(
+    "At least 1 PCR Adapter detected (reads, #)" = raw_reads_n,
+    "At least 1 PCR  Adapter detected (reads, %)" = round(100*length(unique(blast_search.filter$X1)) / raw_reads_n,2),
+    "At least 1 PCR  Adapter detected, + strand (reads, #)" = length(unique(blast_search.filter$X1[blast_search.filter$X2 == "PCR_ADAPTER_FWD"])) * n_chunks,
+    "At least 1 PCR  Adapter detected, + strand, from raw reads (reads, %)" = round(100*length(unique(blast_search.filter$X1[blast_search.filter$X2 == "PCR_ADAPTER_FWD"])) / raw_reads_n,2),
+    "At least 1 PCR  Adapter detected, - strand (reads, #)" = length(unique(blast_search.filter$X1[blast_search.filter$X2 == "PCR_ADAPTER_REV"])) * n_chunks,
+    "At least 1 PCR  Adapter detected, - strand, from raw reads (reads, %)" = round(100*length(unique(blast_search.filter$X1[blast_search.filter$X2 == "PCR_ADAPTER_REV"])) / raw_reads_n,2)
+    ) %>% t()
+) 
+
+blast_search.filter <- NULL
+
+```
+
+BLAST is looking for sequences with an identity to the PCR adapter sequence > `r 100*blast_identity`% and match >60% of the PCR adapter length (`r nchar(pcr_adapter)` bp). The following graphics shows the distribution of these parameters in the blast results.
+
+```{r blast_3, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=16}
+
+p1 <- ggplot() +
+    geom_histogram(data = blast_search, aes(x = X3, fill = X2), position = "dodge", binwidth = 1, color = "black") +
+        theme_bw(base_size = 18) +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+    xlab("Sequence identity (%)") +
+    ylab("Reads (#)") +
+  scale_y_continuous(labels = scales::comma) +
+    ggtitle("PCR adapt. Identity") +
+  scale_x_continuous(breaks = seq(0,100,10)) +
+  geom_vline(xintercept = 100*blast_identity, linetype = "dashed", color = "darkred")
+
+p2 <- ggplot() +
+    geom_histogram(data = blast_search, aes(x = X12, fill = X2), position = "dodge", binwidth = 1, color = "black") +
+        theme_bw(base_size = 18) +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+    xlab("Match Length (bp)") +
+    ylab("Reads (#)") +
+  scale_x_continuous(breaks = seq(0,25,1)) +
+  scale_y_continuous(labels = scales::comma) +
+    ggtitle("PCR adapt. Identity") +
+  geom_vline(xintercept = floor(0.6*nchar(pcr_adapter)), linetype = "dashed", color = "darkred")
+
+cowplot::plot_grid(nrow = 2,
+  cowplot::plot_grid(p1 + theme(legend.position = "none"), p2 + theme(legend.position = "none"), nrow = 1),
+   cowplot::get_legend(p1), rel_heights = c(0.9,0.1))
+``` 
+
+The PCR adapter sequences are expected to be at the read edges (5' and 3'). Sequences located inside the read body can be associated to chimeric reads. 
+
+```{r blast_2, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+ggplot() +
+    geom_histogram(data = mutate(blast_search, p_read_start = ifelse(X14 == "minus", 100*X6/X8, 100*X7/X8)), aes(x = p_read_start), binwidth = 2) +
+        theme_bw(base_size = 18) +
+    xlab("Read Body (%)") +
+    ylab("Reads (#)") +
+    ggtitle("PCR Adapt. Pos. in Read Body")
+```
+
+Ideally, FLASH-seq ONT reads contain two PCR adapter sequences per read (in opposite orientations). Additional ones may be the reflect of chimeric artefacts. Display only those >0.1% of the reads.
+
+```{r blast_4, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+  
+blast_search %>% 
+  group_by(X1) %>% 
+  summarise(n_fwd = sum(X2 == "PCR_ADAPTER_FWD"),
+            n_rev = sum(X2 == "PCR_ADAPTER_REV")) %>%
+  ungroup() %>%
+  mutate(total = n(),
+         final = paste0("fwd:", n_fwd, "-rev:", n_rev)) %>%
+  group_by(final) %>%
+  summarise(perc = 100*n()/unique(total)) %>%
+  filter(perc > 0.1) %>%
+  ggplot() +
+    geom_bar(aes(y = perc, x = reorder(final, perc)), stat="identity", position = "dodge", color = "black") +
+    theme_bw(base_size = 18) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size  = 12)) +
+  scale_y_continuous(breaks =seq(0,100,10)) +
+    xlab("Detected PCR Adapter") +
+    ylab("Reads (%)") +
+    ggtitle("# PCR adapter detected per read (orientation)")
+
+blast_search <- NULL
+
+```
+
+## Chimeric Segment
+
+Chimeric reads are defined as having at least one PCR adapter in the read body (> `r bc_detection_window` bp away of a read edge) and/or having >2 PCR adapters. 
+
+```{r Chimeric segments_1, include=TRUE, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+# chimericSegment.info <- read_tsv(paste0(output_dir, output_suffix, "_chimericSegments.info.txt"), show_col_types = FALSE)
+chimericSegment.info <- vroom::vroom(paste0(output_dir, output_suffix, "_chimericSegments.info.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+segs <- filter(chimericSegment.info, putative_chimeric == TRUE) %>% 
+  group_by(read_id) %>% 
+  summarise(n = n(), .groups = "keep") %>% 
+  ungroup() 
+
+chimeric_reads_n <- length(unique(chimericSegment.info$read_id[chimericSegment.info$putative_chimeric == TRUE]))
+
+knitr::kable(align = "lc",
+    tibble(
+    "Putative chimeric reads (#)" = chimeric_reads_n * n_chunks,
+    "Putative chimeric reads, from raw reads (%)" = round(100*chimeric_reads_n/length(unique(chimericSegment.info$read_id)),3),
+    "Putative chimeric segments (post-split)" = sum(segs$n) * n_chunks,
+    "Made on average of X ligated segments" = paste0(round(mean(segs$n),1), "±", round(sd(segs$n),1))
+    ) %>% t()
+) 
+
+# Update the number of raw reads from there
+# Raw reads after spliting chimeric reads is the sum of the non-chimeric reads and chimeric segments
+# SLOW!! need to find a better solution.
+n_raw_reads.chim_seg <- as.numeric(system(intern = TRUE, paste0("zcat ", output_dir, "/", output_suffix, ".chimeric_segments.fq.gz | wc -l")))/4
+n_raw_reads.non_chim <- as.numeric(system(intern = TRUE, paste0("zcat ", output_dir, "/", output_suffix, ".non_chimeric_reads.fq.gz | wc -l")))/4
+n_raw_reads.update <- n_raw_reads.chim_seg + n_raw_reads.non_chim
+
+```
+
+Reads from FLASH-seq ONT libraries are flanked by the PCR adapter sequences. We define three types of reads:
+
+- **==>...**: The read has one PCR adapter sequence in positive orientation.
+- **...<==**: The read has one PCR adapter sequence at negative orientation.
+- **==>...<==**: The read is flanked by two PCR adapter sequences in opposite orientations.
+
+Chimeric reads follow the same logic but can harbor different combinations. For instance,
+
+...<==|==>...<==|==>...
+
+Based on the PCR adapter orientations the chimeric reads can be split into **segments**. The following graphic display the proportion of these segments in chimeric reads (= made of multiple sub-segments or a PCR adapter sequence in the read body) in green versus regular reads in orange (= made of one type of segment). The percentage is calculated based on the number of raw input reads.
+
+```{r Chimeric segments_2, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+suppressWarnings(print(chimericSegment.info %>%
+  group_by(putative_chimeric, chimera_type) %>%
+  summarise(perc = n()) %>% 
+  ungroup() %>% 
+  mutate(perc = 100*perc/n_raw_reads.update,
+         putative_chimeric = ifelse(putative_chimeric == TRUE, "Chimeric Reads", "Non-Chimeric Reads")) %>%
+  ggplot() +
+      geom_bar(aes(y = perc, x = chimera_type, fill =putative_chimeric ), stat= "identity", position = "dodge", color = "black") + 
+      xlab("") +
+      ylab("Reads (%)") + 
+    facet_wrap("putative_chimeric", scales = "free") +
+      theme_bw(base_size = 18) +
+    theme(legend.position = "none") +
+      scale_fill_manual(values = c(
+        "Chimeric Reads" = "#1B9E77",
+        "Non-Chimeric Reads" = "#D95F02")) +
+  guides(fill = guide_legend(nrow = 1)) + 
+  ggtitle("Segment Type")
+))
+```
+
+Read length distribution before and after splitting the chimeric reads into segments (0-12kb). Only displayed for that single chunk of data. 
+
+```{r Chimeric segments_3, include=TRUE, echo = FALSE, fig.align='center', fig.height=12, fig.width=6}
+mean_read_length <- floor(mean(chimericSegment.info$read_length[chimericSegment.info$putative_chimeric==FALSE]))
+mean_chimeric_read_length <- floor(mean(chimericSegment.info$read_length[chimericSegment.info$putative_chimeric==TRUE]))
+mean_chimeric_segment_length <- floor(mean(chimericSegment.info$segment_width[chimericSegment.info$putative_chimeric==TRUE]))
+
+p1 <- ggplot() +
+      geom_histogram(data = chimericSegment.info, aes(x = read_length, fill = putative_chimeric), binwidth = 100) +
+      xlab("Read Length (bp)") +
+      ylab("Reads") +    
+      theme_bw(base_size = 18) +
+      theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1)) +
+      scale_fill_manual(values = c(
+          "TRUE" = "#1B9E77",
+          "FALSE" = "#D95F02")) +
+    scale_x_continuous(breaks = seq(0,12000,1000), limits = c(0,12000), labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    geom_vline(xintercept = mean_read_length, linetype = "dashed", color = "darkgrey") +
+    geom_vline(xintercept = mean_chimeric_read_length, linetype = "dashed", color = "#1B9E77") +
+    annotate("text", label = 
+               paste0("x̄ (non-chimeric) (bp): ", mean_read_length, "bp\nx̄ (chimeric) (bp): ", mean_chimeric_read_length, "bp"),
+             y = Inf, x = mean_chimeric_read_length, vjust = 1, hjust = 0, size =4) +
+    ggtitle("Before splitting")
+  
+
+p2 <- ggplot() +
+    geom_histogram(data = chimericSegment.info, aes(x = segment_width, fill = putative_chimeric), binwidth = 100) +
+    xlab("Segment Length (bp)") +
+    ylab("Reads") +    
+    theme_bw(base_size = 18) +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = c(
+        "TRUE" = "#1B9E77",
+        "FALSE" = "#D95F02")) +
+    geom_vline(xintercept = mean_chimeric_segment_length, linetype = "dashed", color = "#1B9E77") +
+    annotate("text", label = 
+               paste0("x̄ (chimeric) (bp): ", mean_chimeric_segment_length, "bp"),
+             y = Inf, x = mean_chimeric_read_length, vjust = 1, hjust = 0, size =4) +
+  scale_x_continuous(breaks = seq(0,12000,1000), limits = c(0,12000), labels = scales::comma) +
+  ggtitle("After splitting")
+  
+
+suppressWarnings(
+ cowplot::plot_grid(p1, p2, nrow = 2),
+)
+  
+```
+
+## Mapping Validation
+
+### Banlist
+
+Chimeric reads are split into segments. To validate the breakpoints, the chimeric segments/reads are mapped using minimap2. The mapping of the chimeric reads (primary/supplementary) and segments (primary only) are compared. The overlap between the read/segment mappings is expected to be >`r 100*overlap_threshold`% or the breakpoints are considered as erroneous and the segment/read is flagged (=banlist), later to be discarded. 
+
+```{r Mapping Validation_1, include=TRUE, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+if(validate_chimeric == TRUE){
+  
+  #chimerc_banlist <- read_tsv(paste0(output_dir, output_suffix, "_chimeric_banList.txt"), show_col_types = FALSE)
+  #in_silico_chimerics <- read_tsv(paste0(output_dir, output_suffix, "_in_silico_chimerics.log.txt"), show_col_types = FALSE)
+  #mapping_chimerics <- read_tsv(paste0(output_dir, "/", output_suffix, "_mapping_chimerics.log.txt"), show_col_types = FALSE)
+
+  chimerc_banlist <- vroom::vroom(paste0(output_dir, output_suffix, "_chimeric_banList.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+  in_silico_chimerics <- vroom::vroom(paste0(output_dir, output_suffix, "_in_silico_chimerics.log.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+  mapping_chimerics <- vroom::vroom(paste0(output_dir, "/", output_suffix, "_mapping_chimerics.log.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+  
+  knitr::kable(align = "lc",
+      tibble(
+      "Putative chimeric segments (post-split)" = sum(segs$n) * n_chunks,
+      "Problematic Reads (banlist, #)" = nrow(chimerc_banlist) * n_chunks,
+      "Problematic Reads (banlist, % chim. segs.)" = round(100*nrow(chimerc_banlist) / sum(segs$n), 3),
+      "Problematic Reads (banlist, % total)" = round(100*nrow(chimerc_banlist) / n_raw_reads.update, 3)
+      ) %>% t()
+  ) 
+
+}
+```
+
+Problematic reads - reasons:
+
+- `In-silico chimeric` = In silico chimeric reads not correctly split by Dorado/guppy. 
+
+- `No match chim. read/segm. Mappings` = No match between the split segment primary alignment and the the read mapping (primary / suppl.).
+
+- `Partial match chim. read/segm. Mappings` = Match between the split segment primary alignment and the the read mapping (primary / suppl.) is below `r overlap_threshold`.
+
+Only displayed for that single chunk of data.
+
+```{r Mapping Validation_2, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+if(validate_chimeric == TRUE){
+  chimerc_banlist %>%
+    mutate(TYPE = case_when(
+      TYPE == "NO_MATCH" ~ "No match\nchim. read/segm.\nMappings",
+      TYPE == "PARTIAL_MATCH" ~ "Partial match\nchim. read/segm.\nMappings",
+      TYPE == "IN_SILICO" ~ "In-silico chimeric")) %>%
+    ggplot() +
+    geom_bar(aes(x = TYPE, fill = TYPE), stat= "count", position = "dodge", color = "black") + 
+    xlab("Problematic Chimeric Reads") +
+    ylab("Reads") + 
+    theme_bw(base_size = 18) +
+    theme(legend.position = "none") +
+        scale_fill_manual(values = c(
+          "No match\nchim. read/segm.\nMappings" = "#8DD3C7",
+          "Partial match\nchim. read/segm.\nMappings" = "#FFFFB3",
+          "In-silico chimeric" = "#BEBADA")) +
+    ggtitle("Banlist - Reasons")
+}
+```
+
+```{r Mapping Validation_3, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+if(validate_chimeric == TRUE){
+
+  ggplot() +
+  geom_histogram(data = mapping_chimerics, aes(x = 100*cov.genome), position = "dodge", binwidth = 5, color = "black") + 
+  geom_vline(xintercept = 100*overlap_threshold, linetype ="dashed", color = "darkgrey") +
+      theme_bw(base_size = 18) +
+      theme(legend.position = "top", axis.text.x = element_text(angle = 90, hjust = 1)) +
+      scale_fill_manual(values = c(
+        "TRUE" = "#984EA3",
+        "FALSE" = "#FF7F00")) +
+    ylab("Reads") +
+    xlab("Overlap(%)") +
+    scale_x_continuous(breaks = seq(0,100,5)) +
+  ggtitle("Overlap union of read/segs. alignments")
+}
+```
+ 
+In silico-chimeric reads can occur when the second strand follows too quickly into the pore and is artificially attached to the first read. We have observed an increase of these events when the flowcell is overloaded (R10.4). 
+
+- https://f1000research.com/articles/6-631/v2
+- https://github.com/nanoporetech/dorado
+
+Dorado basecaller or duplex_tools can in theory remove these artifacts. However, in some cases they are left behind and represent an issue for this pipeline as they could be split into two distinct molecules, leading to over-counting. 
+To exclude these events, the segment mappings (primary/supplementary) belonging to a single read are compared. If two segments originating from the same chimeric read are mapping at the same position (overlap >0%) in opposite orientations, they are considered as in-silico chimerics. The smallest alignment of the two is then flagged, later to be removed.
+
+```{r Mapping Validation_4, include=FALSE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+if(validate_chimeric == TRUE){
+
+  # Filter duplicated and self-segment comparisons
+  in_silico_chimerics.filtered <- dplyr::filter(
+      in_silico_chimerics, cov.segments > 0 & query_seg_id != subject_seg_id & genome.query.strand != genome.subject.strand) %>%
+    dplyr::select(simplified_read_id, cov.segments) %>%
+    distinct()
+  
+    ggplot() +
+    geom_histogram(data = in_silico_chimerics.filtered, aes(x = 100*cov.segments), position = "dodge", binwidth = 5, color = "black") + 
+    geom_vline(xintercept = 100*overlap_threshold, linetype ="dashed", color = "darkgrey") +
+        theme_bw(base_size = 18) +
+        theme(legend.position = "top") +
+        scale_fill_manual(values = c(
+          "TRUE" = "#984EA3",
+          "FALSE" = "#FF7F00")) +
+      ylab("Reads") +
+      xlab("Overlap union of segs. align. (%)") +
+      scale_x_continuous(breaks = seq(0,100,5)) +
+    ggtitle("In-silico chimeric map. overlaps")
+
+}
+
+    chimerc_banlist <- NULL
+    in_silico_chimerics <- NULL
+    mapping_chimerics <- NULL
+
+```
+
+```{r Mapping Validation_5, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+chimerc_banlist <- NULL
+in_silico_chimerics <- NULL
+mapping_chimerics <- NULL
+
+```
+
+# Barcodes - VSEARCH
+
+The ISPCR primer position is searched in the first/last `r bc_detection_window` bp of the read using vsearch. On the contrary to BLAST, vsearch only reports one hit per read and per query.
+
+Selected barcode sequence:
+
+`r barcode_primer`
+
+```{r vsearch_1, include=TRUE, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+#extractBarcodes_report <- read_tsv(paste0(output_dir, output_suffix, "_extractBarcodes.report.txt"), show_col_types = FALSE)
+
+extractBarcodes_report <- vroom::vroom(paste0(output_dir, output_suffix, "_extractBarcodes.report.txt"), show_col_types = FALSE, num_threads = n_cores, delim = "\t")
+
+extractBarcodes_report.tmp <- extractBarcodes_report %>%
+  select(-n, -min_lv_dist_bc, -N_bc_same_lv_dist) %>%
+  distinct() %>%
+  summarise(
+    n_reads_with_vsearch_hit = sum(n_reads_with_vsearch_hit),
+    n_reads_correct_bc_total = sum(n_reads_correct_bc_total)
+  )
+  
+knitr::kable(align = "lc",
+    tibble(
+    "Reads with at least one detected barcode (#)" = extractBarcodes_report.tmp$n_reads_with_vsearch_hit * n_chunks,
+    "Reads with at least one detected barcode (%)" = round(digits = 3, round(100*extractBarcodes_report.tmp$n_reads_with_vsearch_hit/n_raw_reads.update, 2)),
+    "Reads with at least one detected good barcode (#)" = extractBarcodes_report.tmp$n_reads_correct_bc_total * n_chunks,
+    "Reads with at least one detected good barcode (%)" = round(digits = 3, round(100*extractBarcodes_report.tmp$n_reads_correct_bc_total/n_raw_reads.update, 2)),
+    ) %>% t()
+) 
+
+```
+
+Only sequences displaying an identity >75% are retained:
+
+```{r vsearch_2, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=16}
+
+vsearch <- vroom::vroom(paste0(output_dir, "vsearch_", str_replace(output_suffix, "_1", ""), "_BC1_1.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+vsearch %>%
+  mutate(barcode = ifelse(barcode=="BC1_fwd", "Cell Barcode - fwd", "Cell Barcode - rev")) %>%
+  mutate(total = length(unique(read_id))) %>%
+  group_by(identity, barcode) %>%
+  summarise(perc = 100*n()/unique(total)) %>%
+  ggplot() +
+  geom_bar(aes(x = identity, y = perc, fill = barcode), stat = "identity", position = "dodge", color = "black") + 
+      theme_bw(base_size = 18) +
+  facet_wrap("barcode") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c(
+          "Cell Barcode - fwd" = "#E41A1C",
+          "Cell Barcode - rev" = "#377EB8")) +
+    ylab("Reads (%)") +
+    xlab("Identity (%)") +
+    scale_x_continuous(breaks = seq(0,100,5)) +
+  scale_y_continuous(labels = scales::comma) +
+  ggtitle("Barcode Primer detected identity")
+```
+
+The identity values returned by vsearch do not account for the length. We expected an average length around `r nchar(barcode_primer)`. 
+
+```{r vsearch_3, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=16}
+vsearch %>%
+  mutate(barcode = ifelse(barcode=="BC1_fwd", "Cell Barcode - fwd", "Cell Barcode - rev")) %>%
+  mutate(total = length(unique(read_id))) %>%
+  group_by(bc_match_l, barcode) %>%
+  summarise(perc = 100*n()/unique(total)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_bar(aes(x = bc_match_l, y = perc, fill = barcode), stat = "identity", position = "dodge", color = "black") + 
+      theme_bw(base_size = 18) +
+  facet_wrap("barcode") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c(
+          "Cell Barcode - fwd" = "#E41A1C",
+          "Cell Barcode - rev" = "#377EB8")) +
+    ylab("Reads (%)") +
+    xlab("Match length (bp)") +
+    scale_x_continuous(breaks = seq(0,100,5)) +
+  scale_y_continuous(labels = scales::comma) +
+  ggtitle("Barcode Primer detected length")
+
+```
+
+```{r vsearch_4, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=8}
+
+mydata <- vsearch %>%
+    select(barcode, mism, gap_open) %>%
+    pivot_longer(names_to = "Errors", values_to = "Counts", -barcode) %>%
+    mutate(barcode = ifelse(barcode=="BC1_fwd", "BC_fwd", "BC_rev"),
+           Counts = factor(Counts),
+           Errors = ifelse(Errors=="mism", "Mismatches", "Open-Gaps"))
+ggplot() +
+    geom_bar(data = mydata, aes(x = Counts, fill = barcode), position = "dodge", stat = "count", color = "black") + 
+    facet_wrap("Errors", nrow = 2) +
+    theme_bw(base_size = 18) +
+    theme(legend.position = "none") +
+      scale_fill_manual(values = c(
+          "BC_fwd" = "#E41A1C",
+          "BC_rev" = "#377EB8")) +
+    ylab("Counts") +
+    xlab("BC. Detected Length (bp)") +
+  ggtitle("Barcode Primer Errors")
+
+```
+
+After PCR /sequencing, one barcode can diverge enough and match several barcodes of the whitelist with a the same lv distance. Whenever possible they are corrected using the barcode at the other end. For instance, a read has two BC, forward: BC1 (perfect match) and reverse: BC1 (mismatches). Having the forward means that we can confidently assign it to BC1.
+
+The first plot depicts the levenstein distances to the whitelist of these barcodes with mismatches. The second one shows the relationship between the number of mismatches and to how many whitelist indexes a barcode with mismatches can be associated with. Thanks to the barcode design, the majority of the barcodes should have only one associated barcode, even when displaying mismatches. Only those within the bottom left corner are considered.
+
+```{r vsearch_5, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=16}
+
+# Only look at the BC with mismatches. Reads can include two barcodes with mismatches. 
+cowplot::plot_grid(nrow = 1, align = "v",
+                   extractBarcodes_report %>%
+  mutate(total_detected_bc = sum(n)) %>%
+  group_by(min_lv_dist_bc) %>%
+  summarise(perc = 100*sum(n)/unique(total_detected_bc)) %>%
+  ggplot() +
+  geom_bar(aes(y = perc, x = as.numeric(min_lv_dist_bc)), position = "dodge", stat = "identity", color = "black") + 
+  theme_bw(base_size = 18) +
+  scale_x_continuous(breaks = seq(0,15,1)) + 
+    ylab("BC with mismatches (%)") +
+    xlab("Minimal Lv distance to a known barcode"),
+
+extractBarcodes_report %>%
+  mutate(total_detected_bc = sum(n)) %>%
+  group_by(min_lv_dist_bc, N_bc_same_lv_dist) %>%
+  summarise(perc = 100*sum(n)/unique(total_detected_bc)) %>%
+  ggplot() +
+  geom_point(aes(y = N_bc_same_lv_dist, x = min_lv_dist_bc, size = perc, fill = perc),  shape = 23) + 
+  theme_bw(base_size = 18) +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_c(name = "Mismatches Reads (%)") +
+  scale_shape_manual(name = "Mismatches Reads (%)") +
+  scale_x_continuous(breaks = seq(0,15,1)) + 
+  geom_hline(yintercept = 3.5, color = "darkred", linetype ="dashed") +
+  geom_vline(xintercept = 3.5, color = "darkred", linetype ="dashed") +
+  scale_y_continuous(breaks = seq(0,384,25)) + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         size=guide_legend(nrow=2,byrow=TRUE)) + 
+ ylab("Linked BC") +
+ xlab("Minimal Lv distance to a known barcode") 
+)
+
+extractBarcodes_report <- NULL
+vsearch <- NULL
+
+```
+
+# Optional - UMI
+
+If present, UMI are detected and if necessary corrected at the demultiplexing stage.
+
+Deletions are masked with "N" in monomeric UMI.
+
+Trimeric UMI are handled corrected based on a whitelist. Uncertain trimer are masked with "NNN". Please refer to the method section from the article.
+
+```{r umi_1, eval=UMI_CONDITION, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+outsuffixfinal <- str_replace(output_suffix, "_1", "")
+getUMI_report <- vroom::vroom(paste0(output_dir, outsuffixfinal, "_FLASHseqONT_output/", outsuffixfinal, "_get_UMI.report.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+if(sampleSheet$UMI_TYPE == "TRIMER"){
+    knitr::kable(align = "lc",
+      tibble(
+       "Reads with a putative UMI detected by vsearch" = sum(getUMI_report$n_vsearch_hit_umidTseq) ,
+       "Reads with a putative UMI detected by vsearch, % raw reads" = round(100*sum(getUMI_report$n_vsearch_hit_umidTseq) / (n_raw_reads.update*n_chunks),3),
+       "Reads with a correct UMI" = sum(getUMI_report$n_umi_first_pass, getUMI_report$n_umi_second_pass),
+       "Reads with a correct UMI, % raw reads" = round(100*sum(getUMI_report$n_umi_first_pass, getUMI_report$n_umi_second_pass) / (n_raw_reads.update*n_chunks),3),
+       "Reads with a correct UMI containing masked bases, % raw reads" = round(100*sum(getUMI_report$n_umi_masked_bases) / (n_raw_reads.update*n_chunks),3)
+      ) %>% t()
+  )
+
+} else if(sampleSheet$UMI_TYPE == "MONOMER") {
+    knitr::kable(align = "lc",
+      tibble(
+
+       "Reads with a UMI detected by vsearch (#)" = sum(getUMI_report$n_vsearch_hit_umidTseq) ,
+       "Reads with a UMI detected by vsearch, % raw reads" = round(100*sum(getUMI_report$n_vsearch_hit_umidTseq) / (n_raw_reads.update*n_chunks),3),
+       "Reads with a correct UMI containing masked bases, % raw reads" = round(100*sum(getUMI_report$n_umi_masked_bases) / (n_raw_reads.update*n_chunks),3)
+      ) %>% t()
+    )
+
+}
+    getUMI_report <- NULL
+
+  
+
+```
+
+# Barcodes - Demultiplexing 
+
+Cell barcode sequences are compared to the whitelist. Perfect match (="PERFECT") are set aside while partial matches are corrected (="CORRECTED", levenstein distance < 3). 
+
+```{r barcodes, include=TRUE, echo = FALSE, fig.align='center', fig.height=18, fig.width=8}
+
+#detected_barcodes <- read_tsv(paste0(output_dir, output_suffix, "_detected_barcodes.txt"), show_col_types = FALSE)
+outsuffixfinal <- str_replace(output_suffix, "_1", "")
+detected_barcodes <- vroom::vroom(paste0(output_dir, output_suffix, "_detected_barcodes.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+
+knitr::kable(align = "lc",
+      tibble(
+       "Reads with at least one correct barcode" = nrow(filter(detected_barcodes, !index_unique %in% c("Undetermined", "Chimeric"))) * n_chunks,
+       "Reads with at least one correct barcode (%, total raw reads)" = round(100*nrow(filter(detected_barcodes, !index_unique %in% c("Undetermined", "Chimeric")))/n_raw_reads.update, 3),
+       "Reads with chimeric barcode pairs" = nrow(filter(detected_barcodes, index_unique == "Chimeric")) * n_chunks,
+       "Reads with chimeric barcode pairs (%, total raw reads)" = round(100*nrow(filter(detected_barcodes, index_unique == "Chimeric"))/n_raw_reads.update, 3),
+       "Reads with undetermined barcode pairs" = nrow(filter(detected_barcodes, index_unique == "Undetermined")) * n_chunks,
+       "Reads with undetermined barcode pairs (%, total raw reads)" = round(100*nrow(filter(detected_barcodes, index_unique == "Undetermined"))/n_raw_reads.update, 3),
+      ) %>% t()
+  ) 
+
+detected_barcodes <- mutate(detected_barcodes, `Chimeric Segment` = ifelse(grepl("_chimeric=TRUE", read_id), "Chimeric Segment", "Non-Chimeric Segment")) 
+
+detected_barcodes.counts <- detected_barcodes %>%
+  group_by(index_unique, `Chimeric Segment`) %>%
+  summarise(n = n(), .groups = "keep") %>%
+  ungroup() %>%
+  filter(n > min_reads) %>%
+  mutate(total = sum(n),
+         perc = 100*n/unique(total)) %>%
+  arrange(index_unique) %>%
+  mutate(is_selected_bc = index_unique %in% selected_bc)
+
+
+```
+
+The reads can harbor one correct barcode (BC-) or the same barcode at both ends (BC-BC)
+
+```{r barcodes2, include=TRUE, echo = FALSE, fig.align='center', fig.height=4, fig.width=8}
+
+detected_barcodes %>%
+  mutate(total = n()) %>%
+  filter(index_unique != "Undetermined") %>%
+  group_by(EndCombination, `Chimeric Segment`) %>%
+  summarise(n = n(),
+            perc = 100*n()/unique(total), .groups = "keep") %>%
+  ggplot() +
+  geom_bar(aes(y = perc, x = EndCombination, fill = `Chimeric Segment`), stat= "identity", position = "dodge", color = "black") + 
+  xlab("") +
+  facet_wrap(~`Chimeric Segment`) +
+  ylab("Reads (%)") + 
+  theme_bw(base_size = 18) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c(
+        "Chimeric Segment" = "#1B9E77",
+        "Non-Chimeric Segment" = "#D95F02")) +
+  guides(fill = guide_legend(nrow = 1))
+
+detected_barcodes <- NULL
+
+```
+
+Read distribution per barcode.
+
+```{r barcodes4, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=12}
+  
+outsuffixfinal <- str_replace(output_suffix, "_1", "")
+demultiplexing_report <- vroom::vroom(paste0(output_dir, outsuffixfinal, "_FLASHseqONT_output/", outsuffixfinal, "_demultiplex.report.txt"), show_col_types = FALSE, delim = "\t", num_threads = n_cores) 
+
+demultiplexing_report %>%
+  group_by(Barcode) %>%
+  summarise(n = sum(n_reads_before_demultiplexing)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(Barcode,n), y = n), stat = "identity", color = "black") + 
+    theme_bw(base_size = 18) +
+    ylab("Reads") +
+    xlab("Barcodes") +
+  scale_y_continuous(labels = scales::comma) +
+  theme(axis.text.x = element_blank())
+
+```
+
+Barcode distribution (on Plate). 
+
+```{r barcodes5, include=TRUE, echo = FALSE, fig.align='center', fig.height=6, fig.width=12}
+  
+
+bc <- read_tsv(system.file("extdata", "BC_arrangement_plate_384.txt", package="FSnanoporeR"), show_col_types = FALSE)
+
+demultiplexing_report %>%
+  group_by(Barcode) %>%
+  summarise(Reads = sum(n_reads_before_demultiplexing)) %>%
+  ungroup() %>%
+  left_join(bc, by = c("Barcode"="BC")) %>%
+  mutate(ROWS = factor(ROWS, levels = rev(LETTERS[1:16]))) %>%
+  ggplot(aes(x = COLS, y = ROWS, fill = log10(Reads))) +
+  geom_point(shape = 22, size = 6) +
+  scale_fill_viridis_c(option = "inferno") +
+  theme_bw(base_size = 12) +
+  scale_x_continuous(breaks = 1:24, limits = c(1,24)) +
+  theme(legend.position = "bottom")
+demultiplexing_report <- NULL
+```

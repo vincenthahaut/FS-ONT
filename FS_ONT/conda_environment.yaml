@@ -1,0 +1,44 @@
+name: FSnanopore
+channels:
+ - conda-forge
+ - bioconda
+ - defaults
+ - r
+dependencies:
+ - python=3.10.8
+ - minimap2=2.26
+ - snakemake
+ - samtools=1.15
+ - vsearch=2.22.1
+ - r-essentials
+ - blast=2.14.0
+ - umi_tools
+ - r-yaml
+ - r-tidyverse
+ - r-memuse
+ - seqkit=2.4.0
+ - isoquant=3.2.0
+ - bioconductor-biostrings
+ - bioconductor-dnabarcodes
+ - bioconductor-shortread
+ - bioconductor-genomicalignments
+ - bioconductor-genomicranges
+ - bioconductor-rsamtools
+ - r-plyr
+ - r-cowplot
+ - r-scales
+ - r-stringdist
+ - r-magrittr
+ - r-foreach
+ - bioconductor-rtracklayer
+ - r-doParallel
+ - pandoc
+ - r-rmdformats
+ - r-rmarkdown
+ - r-reshape2
+ - conda-build
+ - rpy2=3.5.1
+ - r-conflicted
+# - subread
+# - rseqc
+# - bbmap

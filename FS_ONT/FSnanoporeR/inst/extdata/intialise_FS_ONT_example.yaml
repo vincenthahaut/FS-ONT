@@ -1,0 +1,67 @@
+# YAML
+
+## General
+# OUTPUT_DIR, character - output directory
+# OUTPUT_SUFFIX, character - sample id
+# FASTQ_INPUT, character - folder with input FASTQs or single input file. Accept compressed (.gz) or uncompressed.
+# THREADS, numeric - number of thread available to split the process.
+# N_CHUNKS, numeric - split the data into that many chunks before starting. Each chunk will be processed by 1 core.
+# COMBINE_FILES. Combine files from multi-threading. Required for generating report.
+# GENERATE_REPORT, boolean - Should a rmarkdown report be generated? Only work if COMBINE_FILE is TRUE.
+# CLEANUP_BEFORE, boolean - should the intermediate files be cleaned afterwards ? 
+# CLEANUP_AFTER, boolean - should you remove the initial folder?
+# SILENT, boolean - remove part of the std output.
+OUTPUT_DIR: "/home/vincent.hahaut/data_storage/ONT/08032024_PAW04721_FSNanopore/"
+OUTPUT_SUFFIX: "MMRET_780"
+FASTQ_INPUT: "/home/vincent.hahaut/data_storage/ONT/08032024_PAW04721_FSNanopore/demultiplexed_fastq/"
+THREADS: 25
+N_CHUNKS: 75
+GENERATE_REPORT: TRUE
+COMBINE_FILES: TRUE
+CLEANUP_BEFORE: TRUE
+CLEANUP_AFTER: FALSE
+SILENT: TRUE
+
+## chimeric_mapping_validation
+# VALIDATE_CHIMERIC: boolean - run the chimeric detection
+VALIDATE_CHIMERIC: TRUE
+
+## extractBarcodes
+# WHITELIST, character - Path to the barcode whitelist. If left "", will use the one stored in the package.
+# SELECTED_BC, list ([1,2,...]) - selected barcodes. If left "", will look for all the barcodes available in the whitelist.
+WHITELIST: ""
+SELECTED_BC: ""
+
+## filter_trim_demultiplex
+# READ_TRIMMING, boolean - should the barcode / dT / TSO be trimmed? Will leave the poly-A tail and (CCCG).
+# MIN_READS, numeric - minimal number of reads assigned to a barcode to report it. 
+# UMI_TYPE: "NONE", "MONOMER" or "TRIMER"
+# STRAND_SPECIFIC, boolean - if true, will reverse complement reads in 3'->5' based on their oligo-dT orientation.
+READ_TRIMMING: TRUE
+MIN_READS: 1000
+UMI_TYPE: "MONOMER"
+STRAND_SPECIFIC: TRUE
+
+# Minimap2
+# MINIMAP2_Binaries, character - Full path or replace by "minimap2" if installed.
+# MINIMAP2_BED, character - BED file generated with paftools.js
+# MINIMAP2_REF, character - Pre-Indexed file .mmi only.
+# MAX_MEMORY, numeric - Minimap2 requires ~10 Gb memory to run. Running it in parallel can quickly overload the system. Will take 75% of the RAM as reference by default to preserve ressources.
+MINIMAP2_Binaries: "/home/vincent.hahaut/data_storage/binaries/minimap2/minimap2"
+MINIMAP2_BED: "/home/vincent.hahaut/data_storage/REFERENCES/mmus/genome_annotation.bed"
+MINIMAP2_REF: "/home/vincent.hahaut/data_storage/REFERENCES/mmus/mmu.mni"
+MAX_MEMORY: 200
+
+# Isoquant
+# RUN_ISOQUANT_ONLY, boolean.
+# ISOQUANT, boolean - Should isoquant be run?
+# ISOQUANT_FA, character - Path to isoquant fasta reference
+# ISOQUANT_GTF, character - Path to Isoqant GTF
+# DOWNSAMPLE_N_READS, "" or numeric - If set to >0, will downsample isoquant bam files to N reads. If set to "", doesn't do the downsampling
+# TRANSCRIPT_COUNTS_TYPE, "with_inconsistent" or "unique_only" - see isoquant
+RUN_ISOQUANT_ONLY: FALSE
+ISOQUANT: TRUE
+ISOQUANT_FA: "/home/vincent.hahaut/data_storage/REFERENCES/mmus/filtered.genome.fa"
+ISOQUANT_GTF: "/home/vincent.hahaut/data_storage/REFERENCES/mmus/refdata-gex-mm10-2020-A/genes/genes.gtf"
+DOWNSAMPLE_N_READS: ""
+TRANSCRIPT_COUNTS_TYPE: "unique_only"
